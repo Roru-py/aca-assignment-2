@@ -136,9 +136,9 @@ void CACHE::l2c_replacement_final_stats()
     // Avoid divide-by-zero
     if (retired == 0) retired = 1;
 
-    double overall_mpki = (double)tot_miss*1000.0 /retired;
-    double instr_mpki   = (double)inst_miss*1000.0 /retired;
-    double data_mpki    = (double)data_miss*1000.0 /retired;
+    double overall_mpki = (double)tot_miss*1000.0 /(double)retired;
+    double instr_mpki   = (double)inst_miss*1000.0 /(double)retired;
+    double data_mpki    = (double)data_miss*1000.0 /(double)retired;
 
     cout << endl;
     cout << "=== I-RRIP L2C Replacement Final Stats ===" << endl;
