@@ -1,4 +1,4 @@
- #include "cache.h"
+#include "cache.h"
 
 #define maxRRPV 3
 
@@ -173,7 +173,12 @@ void CACHE::l2c_update_replacement_state(
     else
     {
         // Cache Fill (miss insertion):
-        if (irrip_mode && isInstruction)
+        if (type == PREFETCH)
+        {
+            // Prefetch-aware insertion: insert prefetch packets at maxRRPV (3) to avoid pollution
+            l2_rrpv[set][way] = maxRRPV;
+        }
+        else if (irrip_mode && isInstruction)
         {
             // In I-RRIP mode, prioritize instructions by inserting at MRU (0)
             l2_rrpv[set][way] = 0;
