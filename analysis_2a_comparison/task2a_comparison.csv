@@ -1,0 +1,7 @@
+trace,policy,ipc,speedup,l2c_load_mpki,l2_instruction_load_mpki,l2_data_load_mpki,source_log
+Trace1,Baseline LRU,0.232386,1.0,17.7506,10.3965,7.35408,/home/haripreethps/course_work/sem_5/ACA/assignment_2/trial_champsim/results_2a_comparison/baseline_LRU_Trace1.txt
+Trace1,I-RRIP,0.234612,1.009578890294596,19.0635,9.0358,10.0277,/home/haripreethps/course_work/sem_5/ACA/assignment_2/trial_champsim/results_2a_comparison/task2A_IRRIP_Trace1.txt
+Trace2,Baseline LRU,0.250946,1.0,28.2597,19.699,8.56068,/home/haripreethps/course_work/sem_5/ACA/assignment_2/trial_champsim/results_2a_comparison/baseline_LRU_Trace2.txt
+Trace2,I-RRIP,0.259057,1.0323216947072278,22.5938,10.163,12.4308,/home/haripreethps/course_work/sem_5/ACA/assignment_2/trial_champsim/results_2a_comparison/task2A_IRRIP_Trace2.txt
+Trace3,Baseline LRU,0.382022,1.0,3.96856,1.13536,2.8332,/home/haripreethps/course_work/sem_5/ACA/assignment_2/trial_champsim/results_2a_comparison/baseline_LRU_Trace3.txt
+Trace3,I-RRIP,0.384399,1.0062221547450148,3.9708,0.69924,3.27156,/home/haripreethps/course_work/sem_5/ACA/assignment_2/trial_champsim/results_2a_comparison/task2A_IRRIP_Trace3.txt

@@ -1,0 +1,155 @@
+
+#include "cache.h"
+#include "ooo_cpu.h"
+
+#define maxRRPV 3
+
+//per-set, per-way RRPV storage
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+static uint64_t tot_miss   = 0;  // total L2C misses (all types)
+static uint64_t inst_miss   = 0;  // L2C misses for instruction lines
+static uint64_t data_miss    = 0;  // L2C misses for data/other lines
+static uint64_t tot_access = 0;  // total L2C accesses (hit + miss)
+static uint64_t inst_access = 0;  // L2C accesses for instruction lines
+static uint64_t data_access  = 0;  // L2C accesses for data/other lines
+static uint64_t num_ret    = 0;  // retired instructions (for MPKI)
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize I-RRIP (Instruction-Conscious RRIP) state for L2C" << endl;
+
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++)
+            l2_rrpv[i][j] = maxRRPV;  // start all lines maxRRPV , cause given in rrip file
+}
+
+
+// find replacement victim
+//first make sure that all the lines are instr and then only we remove them but aging is uniform only
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
+                                 const BLOCK *current_set, uint64_t ip,
+                                 uint64_t full_addr, uint32_t type)
+{
+    while (1)
+    {
+        // we are looking for data stuff to evict first
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] == maxRRPV && this->block[set][i].instruction != 1)
+                return i;
+
+        // if not found above , need to check if every one is instr or not
+        int instr_cnt = 0;
+        for (int i = 0; i < L2C_WAY; i++)
+            if (this->block[set][i].valid && this->block[set][i].instruction == 1)
+                instr_cnt++;
+
+        if (instr_cnt == L2C_WAY)
+        {
+            // this is fallback, cause entire set is instructions, now we evict one with maxRRPV
+            for (int i = 0; i < L2C_WAY; i++)
+                if (l2_rrpv[set][i] == maxRRPV)
+                    return i;
+            
+        }
+
+        // Age all lines, it should be done to every line (incase nothing to evict)
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] < maxRRPV)
+                l2_rrpv[set][i]++;
+    }
+
+    assert(0);
+    return 0;
+}
+
+// called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way,
+                                          uint64_t full_addr, uint64_t ip,
+                                          uint64_t victim_addr, uint32_t type,
+                                          uint8_t hit, uint8_t isinstr)
+{
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK)
+        TYPE_NAME = "WB";
+    else if (type == LOAD_TRANSLATION)
+	TYPE_NAME = "L_TN";
+    else if (type == PREFETCH_TRANSLATION)
+	TYPE_NAME = "P_TN";
+    else if (type == TRANSLATION_FROM_L1D)
+	TYPE_NAME = "TN_L1D";
+    else
+        assert(0);
+
+    if (hit) TYPE_NAME += "_HIT";
+    else      TYPE_NAME += "_MISS";
+
+    //writebacks from upper level dont carry a meaningful instruction bit and they shouldnt change RRPV (they just dirty the line)
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+    if (hit && (type == WRITEBACK))
+        return;
+
+    
+    // stats stuff , we are counting during simulation only (after warmup) by checking warmup_complete
+    if (warmup_complete[cpu]) {
+        tot_access++;
+        if (isinstr)
+            inst_access++;
+        else
+            data_access++;
+
+        if (!hit) {
+            tot_miss++;
+            if (isinstr)
+                inst_miss++;
+            else
+                data_miss++;
+        }
+    }
+
+    //updating the rrpv vals
+    if (hit) {
+        l2_rrpv[set][way] = 0;
+    } else {
+        if (isinstr)
+            l2_rrpv[set][way] = 0;          // instruction is given 0 right
+        else
+            l2_rrpv[set][way] = maxRRPV - 1; // this one is normal rrip only
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+    // Gather the number of retired instructions from the CPU
+    // ooo_cpu[0] is the primary simulated CPU
+    uint64_t retired = ooo_cpu[0].num_retired;
+
+    // Avoid divide-by-zero
+    if (retired == 0) retired = 1;
+
+    double overall_mpki = (double)tot_miss*1000.0 /retired;
+    double instr_mpki   = (double)inst_miss*1000.0 /retired;
+    double data_mpki    = (double)data_miss*1000.0 /retired;
+
+    cout << endl;
+    cout << "=== I-RRIP L2C Replacement Final Stats ===" << endl;
+    cout << fixed << setprecision(4);
+    cout << "  Retired Instructions       : " << retired << endl;
+    cout << "  L2C Total Accesses         : " << tot_access << endl;
+    cout << "  L2C Total Misses           : " << tot_miss   << endl;
+    cout << "  L2C Instruction Misses     : " << inst_miss   << endl;
+    cout << "  L2C Data Misses            : " << data_miss    << endl;
+    cout << "  L2C Overall Load MPKI      : " << overall_mpki << endl;
+    cout << "  L2C Instruction Load MPKI  : " << instr_mpki   << endl;
+    cout << "  L2C Data Load MPKI         : " << data_mpki    << endl;
+    cout << "===========================================" << endl;
+}

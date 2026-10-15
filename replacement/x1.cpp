@@ -1,0 +1,195 @@
+ #include "cache.h"
+
+#define maxRRPV 3
+
+// L2 RRPV state: 2 bits per cache block (values 0 to 3)
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+// -------------------------------------------------------------
+// Dynamic Adaptation: Leader-Set Sampling
+// -------------------------------------------------------------
+// Sampled metrics from designated leader sets
+static uint64_t leader_instr_accesses = 0;
+static uint64_t leader_data_accesses  = 0;
+static uint64_t leader_instr_misses   = 0;
+static uint64_t leader_data_misses    = 0;
+
+// Threshold for switching follower sets to I-RRIP
+static constexpr double INSTR_THRESHOLD = 0.25;
+
+// Designate 1 out of every 32 sets as an RRIP leader set
+bool is_rrip_leader(uint32_t set)
+{
+    return (set % 32 == 0);
+}
+
+// Compute the instruction pressure/activity ratio from leader sets
+double get_instruction_ratio()
+{
+    uint64_t total_accesses = leader_instr_accesses + leader_data_accesses;
+    uint64_t total_misses   = leader_instr_misses + leader_data_misses;
+    uint64_t denominator   = total_accesses + total_misses;
+
+    if (denominator == 0)
+        return 0.0;
+
+    return static_cast<double>(leader_instr_accesses + leader_instr_misses) / denominator;
+}
+
+// Decide whether follower sets should use I-RRIP or standard RRIP
+bool use_irrip_mode()
+{
+    return get_instruction_ratio() > INSTR_THRESHOLD;
+}
+
+// -------------------------------------------------------------
+// 1. Initialize Replacement State
+// -------------------------------------------------------------
+void CACHE::l2c_initialize_replacement()
+{
+    for (int set = 0; set < L2C_SET; set++)
+    {
+        for (int way = 0; way < L2C_WAY; way++)
+        {
+            l2_rrpv[set][way] = maxRRPV;
+        }
+    }
+
+    leader_instr_accesses = 0;
+    leader_data_accesses  = 0;
+    leader_instr_misses   = 0;
+    leader_data_misses    = 0;
+}
+
+// -------------------------------------------------------------
+// 2. Find Victim
+// -------------------------------------------------------------
+uint32_t CACHE::l2c_find_victim(
+    uint32_t cpu,
+    uint64_t instr_id,
+    uint32_t set,
+    const BLOCK *current_set,
+    uint64_t ip,
+    uint64_t full_addr,
+    uint32_t type)
+{
+    // Leader sets always use baseline RRIP.
+    // Follower sets use I-RRIP only when instruction pressure is high.
+    bool irrip_mode = !is_rrip_leader(set) && use_irrip_mode();
+
+    // Step A: Prefer an invalid line if one exists
+    for (int way = 0; way < L2C_WAY; way++)
+    {
+        if (!current_set[way].valid)
+            return way;
+    }
+
+    // Step B: Search for maxRRPV victim, aging lines if none found
+    while (true)
+    {
+        // In I-RRIP mode, check if there are any valid data lines in this set
+        bool has_data_line = false;
+        if (irrip_mode)
+        {
+            for (int way = 0; way < L2C_WAY; way++)
+            {
+                if (current_set[way].valid && current_set[way].instruction != 1)
+                {
+                    has_data_line = true;
+                    break;
+                }
+            }
+        }
+
+        // Search for a line at maxRRPV
+        for (int way = 0; way < L2C_WAY; way++)
+        {
+            if (l2_rrpv[set][way] != maxRRPV)
+                continue;
+
+            // In I-RRIP mode: protect instructions by skipping them if a data line exists
+            if (irrip_mode && has_data_line && current_set[way].instruction == 1)
+                continue;
+
+            return way;
+        }
+
+        // Step C: Age all lines by incrementing RRPV (saturating at maxRRPV)
+        for (int way = 0; way < L2C_WAY; way++)
+        {
+            if (l2_rrpv[set][way] < maxRRPV)
+                l2_rrpv[set][way]++;
+        }
+    }
+}
+
+// -------------------------------------------------------------
+// 3. Update Replacement State (Hit / Fill)
+// -------------------------------------------------------------
+void CACHE::l2c_update_replacement_state(
+    uint32_t cpu,
+    uint32_t set,
+    uint32_t way,
+    uint64_t full_addr,
+    uint64_t ip,
+    uint64_t victim_addr,
+    uint32_t type,
+    uint8_t hit,
+    uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // Writeback hits do not update recency
+    if (hit && (type == WRITEBACK))
+        return;
+
+    // Collect training metrics from leader sets (after warmup)
+    if (warmup_complete[cpu] && is_rrip_leader(set))
+    {
+        if (isInstruction)
+        {
+            leader_instr_accesses++;
+            if (!hit)
+                leader_instr_misses++;
+        }
+        else
+        {
+            leader_data_accesses++;
+            if (!hit)
+                leader_data_misses++;
+        }
+    }
+
+    // Determine operating mode for this set
+    bool irrip_mode = !is_rrip_leader(set) && use_irrip_mode();
+
+    // RRPV Insertion & Promotion:
+    if (hit)
+    {
+        // Hit promotion: promote to MRU (0)
+        l2_rrpv[set][way] = 0;
+    }
+    else
+    {
+        // Cache Fill (miss insertion):
+        if (irrip_mode && isInstruction)
+        {
+            // In I-RRIP mode, prioritize instructions by inserting at MRU (0)
+            l2_rrpv[set][way] = 0;
+        }
+        else
+        {
+            // Baseline RRIP (and data lines in I-RRIP): insert at distant RRPV (2)
+            l2_rrpv[set][way] = maxRRPV - 1;
+        }
+    }
+}
+
+// -------------------------------------------------------------
+// 4. Final Stats Hook (Pure reporting left empty for clarity)
+// -------------------------------------------------------------
+void CACHE::l2c_replacement_final_stats()
+{
+}
+
