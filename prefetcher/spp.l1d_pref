@@ -1,24 +1,220 @@
 #include "cache.h"
 
+// ===================== Stride Pattern Prefetcher (L1D) =====================
+// Per-IP tracker : last page/offset, last stride, uniform-confidence, signature
+// Pattern table  : signature (last 3 strides) -> next stride + confidence
+// Mode per IP    : uniform (conf == 3)  >  non-uniform (signature lookup)
+// Throttling     : recent-prefetch filter -> accuracy -> degree (every epoch)
+// Training and prefetching are done on in-page line offsets (0..63), so no
+// prefetch (and no stride) ever crosses a 4 KB page.
 
-void CACHE::l1d_prefetcher_initialize() 
-{
-    std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
-    std::cout << "------------------------------------------------" << std::endl;
+#define IP_TRACKER_COUNT 32          // fully associative, LRU
+#define MASK_IP          0xFFF       // 12-bit partial IP tag
+#define PAGE_TAG_MASK    0x3FF       // 10-bit partial page tag
+#define LINES_PER_PAGE   64          // 4KB / 64B
+
+#define SIG_MASK         0xFFF       // 3 strides x 4 bits
+#define PT_BITS          7
+#define PT_SIZE          (1 << PT_BITS)
+
+#define UNIFORM_THRESH   3           // need 3 consecutive equal strides
+#define PT_PRED_THRESH   2           // PT confidence needed to predict
+#define CONF_MAX         3
+
+#define PF_SIZE          32          // recent-prefetch filter (direct mapped)
+#define PF_TAG_MASK      0xFFF
+
+#define EPOCH_ISSUED     128         // accuracy re-evaluated every N prefetches
+
+struct IP_TRACKER {
+  bool     valid;                    // 1
+  uint16_t ip;                       // 12
+  uint16_t last_page;                // 10
+  uint8_t  last_off;                 // 6
+  int8_t   last_stride;              // 7
+  uint8_t  uniform_confidence;       // 2
+  uint16_t signature;                // 12
+  uint8_t  lru;                      // 5
+};
+
+struct PT_ENTRY {
+  int8_t  next_stride;               // 7
+  uint8_t confidence;                // 2
+};
+
+struct PF_ENTRY {
+  bool     valid;                    // 1
+  uint16_t tag;                      // 12
+};
+
+static IP_TRACKER trackers[IP_TRACKER_COUNT];
+static PT_ENTRY   pattern_table[PT_SIZE];
+static PF_ENTRY   prefetch_filter[PF_SIZE];
+
+static uint32_t epoch_pf_issued = 0;     // 8 bits
+static uint32_t epoch_pf_useful = 0;     // 8 bits
+static uint32_t dynamic_degree  = 2;     // 3 bits
+
+// statistics only (not hardware)
+static uint64_t st_issued = 0, st_useful = 0, st_uni = 0, st_nonuni = 0;
+
+static inline uint32_t pt_index(uint32_t sig) { return (sig ^ (sig >> PT_BITS)) & (PT_SIZE - 1); }
+static inline uint32_t sig_next(uint32_t sig, int stride) { return ((sig << 4) | (stride & 0xF)) & SIG_MASK; }
+
+static void lru_touch(int index) {
+  for (int i = 0; i < IP_TRACKER_COUNT; i++)
+    if (trackers[i].valid && trackers[i].lru < trackers[index].lru)
+      trackers[i].lru++;
+  trackers[index].lru = 0;
 }
 
-void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
-{
-   
+void CACHE::l1d_prefetcher_initialize() {
+  std::cout << "CPU " << cpu << " L1D Stride Pattern Prefetcher (SPP)" << std::endl;
+  for (int i = 0; i < IP_TRACKER_COUNT; i++) {
+    trackers[i].valid = false;
+    trackers[i].lru = i;
+  }
+  for (int i = 0; i < PT_SIZE; i++) { pattern_table[i].next_stride = 0; pattern_table[i].confidence = 0; }
+  for (int i = 0; i < PF_SIZE; i++) prefetch_filter[i].valid = false;
 }
 
-void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
-{
-	return; //metadata_in;
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit,
+                                   uint8_t type, uint8_t critical_ip_flag) {
+  uint64_t cl_addr  = addr >> LOG2_BLOCK_SIZE;
+  uint64_t page_num = addr >> LOG2_PAGE_SIZE;
+  int      off      = cl_addr & (LINES_PER_PAGE - 1);
+  uint16_t page_tag = page_num & PAGE_TAG_MASK;
+
+  // ---- 1. accuracy checker: demand access to a line we prefetched = useful ----
+  {
+    uint32_t fi = cl_addr & (PF_SIZE - 1);
+    uint16_t ft = (cl_addr >> 5) & PF_TAG_MASK;
+    if (prefetch_filter[fi].valid && prefetch_filter[fi].tag == ft) {
+      prefetch_filter[fi].valid = false;
+      epoch_pf_useful++;
+      st_useful++;
+    }
+  }
+
+  // ---- 2. degree throttling at the end of every epoch ----
+  if (epoch_pf_issued >= EPOCH_ISSUED) {
+    uint32_t acc = (epoch_pf_useful * 100) / epoch_pf_issued;
+    if      (acc >= 75) dynamic_degree = 6;
+    else if (acc >= 50) dynamic_degree = 4;
+    else if (acc >= 25) dynamic_degree = 2;
+    else                dynamic_degree = 1;
+    epoch_pf_issued = 0;
+    epoch_pf_useful = 0;
+  }
+
+  // ---- 3. tracker lookup / allocation (LRU) ----
+  uint16_t masked_ip = ip & MASK_IP;
+  int index = -1, victim = 0;
+  for (int i = 0; i < IP_TRACKER_COUNT; i++) {
+    if (trackers[i].valid && trackers[i].ip == masked_ip) { index = i; break; }
+    if (!trackers[i].valid) victim = i;                       // prefer invalid slot
+    else if (trackers[victim].valid && trackers[i].lru > trackers[victim].lru) victim = i;
+  }
+
+  if (index == -1) {
+    index = victim;
+    trackers[index].valid = true;
+    trackers[index].ip = masked_ip;
+    trackers[index].last_page = page_tag;
+    trackers[index].last_off = off;
+    trackers[index].last_stride = 0;
+    trackers[index].uniform_confidence = 0;
+    trackers[index].signature = 0;
+    lru_touch(index);
+    return;
+  }
+
+  IP_TRACKER &t = trackers[index];
+
+  // ---- 4. training (only on in-page strides) ----
+  int stride;
+  bool new_page = (t.last_page != page_tag);
+  if (new_page) {
+    // a stride across pages is meaningless: don't train, but keep the learned
+    // state so prefetching can resume immediately inside the new page
+    stride = t.last_stride;
+    t.last_page = page_tag;
+  } else {
+    stride = off - (int)t.last_off;
+    if (stride == 0) return;
+
+    // (a) pattern table: old signature -> observed stride
+    PT_ENTRY &p = pattern_table[pt_index(t.signature)];
+    if (p.next_stride == stride) {
+      if (p.confidence < CONF_MAX) p.confidence++;
+    } else if (p.confidence > 0) {
+      p.confidence--;
+    } else {
+      p.next_stride = stride;
+      p.confidence = 1;
+    }
+
+    // (b) uniform confidence: any break resets it -> falls back to PT
+    if (stride == t.last_stride) {
+      if (t.uniform_confidence < CONF_MAX) t.uniform_confidence++;
+    } else {
+      t.uniform_confidence = 0;
+    }
+
+    t.signature   = sig_next(t.signature, stride);
+    t.last_stride = stride;
+  }
+  t.last_off = off;
+
+  // ---- 5. prefetch generation ----
+  bool uniform = (t.uniform_confidence >= UNIFORM_THRESH) && (stride != 0);
+  int cum = off;
+  uint32_t sig = t.signature;
+
+  for (uint32_t i = 0; i < dynamic_degree; i++) {
+    int s;
+    if (uniform) {
+      s = stride;
+    } else {
+      PT_ENTRY &q = pattern_table[pt_index(sig)];
+      if (q.confidence < PT_PRED_THRESH || q.next_stride == 0) break;
+      s = q.next_stride;
+      sig = sig_next(sig, s);
+    }
+    cum += s;
+    if (cum < 0 || cum >= LINES_PER_PAGE) break;              // stay inside page
+
+    uint64_t pf_cl = (page_num << (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE)) | cum;
+    uint64_t pf_address = pf_cl << LOG2_BLOCK_SIZE;
+
+    int ok;
+    if (MSHR.occupancy < (MSHR.SIZE >> 1))
+      ok = prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+    else
+      ok = prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+
+    if (ok) {                                                 // count only accepted prefetches
+      uint32_t fi = pf_cl & (PF_SIZE - 1);
+      prefetch_filter[fi].valid = true;
+      prefetch_filter[fi].tag = (pf_cl >> 5) & PF_TAG_MASK;
+      epoch_pf_issued++;
+      st_issued++;
+      if (uniform) st_uni++; else st_nonuni++;
+    }
+  }
+
+  lru_touch(index);
 }
 
-void CACHE::l1d_prefetcher_final_stats()
-{
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way,
+                                      uint8_t prefetch, uint64_t v_evicted_addr,
+                                      uint64_t evicted_addr, uint32_t metadata_in) {
+  return;
+}
 
+void CACHE::l1d_prefetcher_final_stats() {
+  std::cout << "CPU " << cpu << " L1D SPP final stats" << std::endl;
+  std::cout << "Issued: " << st_issued << " Useful(filter): " << st_useful
+            << " Uniform PF: " << st_uni << " Non-uniform PF: " << st_nonuni
+            << " Final degree: " << dynamic_degree << std::endl;
 }
